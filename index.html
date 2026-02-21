@@ -160,6 +160,49 @@
   .fade-row { opacity:0; animation:fadeIn 0.4s ease forwards; }
   @keyframes fadeIn { to{opacity:1} }
 
+  /* HEATMAP */
+  .hm-container { background: var(--bg-card); border: 1px solid var(--border); border-radius: 20px; padding: 32px; }
+  .hm-title { font-weight: 700; font-size: 1.3rem; margin-bottom: 4px; }
+  .hm-subtitle { font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 20px; }
+  .hm-controls { display: flex; align-items: center; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+  .hm-control-label { font-size: 0.8rem; color: var(--text-muted); }
+  .hm-select {
+    background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; font-family: 'Outfit', sans-serif; font-size: 0.85rem; cursor: pointer;
+  }
+  .hm-canvas { min-height: 400px; }
+  .hm-group-section { margin-bottom: 20px; }
+  .hm-group-label {
+    font-weight: 700; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 8px;
+    padding-bottom: 6px; border-bottom: 1px solid var(--border);
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  .hm-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+  .hm-cell {
+    border-radius: 8px; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; padding: 8px 4px; cursor: pointer;
+    transition: all 0.2s ease; position: relative; overflow: hidden;
+    min-width: 70px; min-height: 65px;
+  }
+  .hm-cell:hover { transform: scale(1.08); z-index: 5; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+  .hm-cell-ticker {
+    font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 0.8rem;
+    color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+  }
+  .hm-cell-val {
+    font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 0.72rem;
+    color: rgba(255,255,255,0.85); text-shadow: 0 1px 3px rgba(0,0,0,0.5); margin-top: 2px;
+  }
+  .hm-cell-name {
+    font-family: 'Outfit', sans-serif; font-size: 0.58rem;
+    color: rgba(255,255,255,0.6); margin-top: 1px;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .hm-scale { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 20px; }
+  .hm-scale-bar { width: 250px; height: 14px; border-radius: 7px; background: linear-gradient(90deg, #b71c1c, #ef5350, #555, #43a047, #1b5e20); }
+  .hm-scale-neg { font-size: 0.7rem; color: var(--red); font-family: 'JetBrains Mono', monospace; }
+  .hm-scale-pos { font-size: 0.7rem; color: var(--green-strong); font-family: 'JetBrains Mono', monospace; }
+
   /* TradingView Modal */
   .tv-overlay {
     display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -287,6 +330,7 @@
     <button class="tab-btn active" data-tab="table">📊 RS Table</button>
     <button class="tab-btn" data-tab="rrg">🔄 RRG</button>
     <button class="tab-btn" data-tab="corr">🔗 Correlación</button>
+    <button class="tab-btn" data-tab="heatmap">🟩 Heatmap</button>
   </div>
 
   <!-- TAB 1: RS TABLE -->
@@ -361,6 +405,41 @@
     <div class="corr-tooltip" id="corr-tooltip"></div>
   </div>
 
+  <!-- TAB 4: HEATMAP -->
+  <div id="tab-heatmap" class="tab-content">
+    <div class="hm-container">
+      <div class="hm-title">🟩 Mapa de Calor Sectorial</div>
+      <div class="hm-subtitle">Tamaño proporcional al valor absoluto — Color según rendimiento positivo/negativo</div>
+      <div class="hm-controls">
+        <span class="hm-control-label">Métrica:</span>
+        <select id="hm-metric" class="hm-select">
+          <option value="roc1m">ROC 1M %</option>
+          <option value="roc3m">ROC 3M %</option>
+          <option value="roc6m">ROC 6M %</option>
+          <option value="roc12m">ROC 12M %</option>
+          <option value="rsScore" selected>RS Score</option>
+          <option value="rs1m">RS 1M</option>
+          <option value="rs3m">RS 3M</option>
+          <option value="rs6m">RS 6M</option>
+          <option value="rs12m">RS 12M</option>
+          <option value="pctlScore">Percentil</option>
+        </select>
+        <span class="hm-control-label" style="margin-left:16px">Agrupar por:</span>
+        <select id="hm-group" class="hm-select">
+          <option value="cat">Categoría</option>
+          <option value="subcat">Sub-categoría</option>
+          <option value="none">Sin agrupar</option>
+        </select>
+      </div>
+      <div class="hm-canvas" id="hm-canvas"></div>
+      <div class="hm-scale">
+        <span class="hm-scale-neg">◄ Negativo</span>
+        <div class="hm-scale-bar"></div>
+        <span class="hm-scale-pos">Positivo ►</span>
+      </div>
+    </div>
+  </div>
+
   <div class="last-update" id="last-update"></div>
 </div>
 
@@ -400,6 +479,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.getElementById('tab-' + tab).classList.add('active');
     if (tab === 'rrg' && allData.length) requestAnimationFrame(drawRRG);
     if (tab === 'corr' && allData.length) requestAnimationFrame(drawCorrelation);
+    if (tab === 'heatmap' && allData.length) drawHeatmap();
   });
 });
 
@@ -794,6 +874,121 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeChart();
 });
 
+// ===== HEATMAP =====
+function hmColor(val, maxAbs) {
+  if (maxAbs === 0) return '#555';
+  var ratio = val / maxAbs;
+  ratio = Math.max(-1, Math.min(1, ratio));
+  if (ratio >= 0) {
+    var intensity = ratio;
+    var r = Math.round(30 + (1 - intensity) * 55);
+    var g = Math.round(100 + intensity * 80);
+    var b = Math.round(30 + (1 - intensity) * 55);
+    if (intensity > 0.6) { r = Math.round(27); g = Math.round(94 + intensity * 60); b = Math.round(32); }
+    else if (intensity > 0.3) { r = Math.round(67); g = Math.round(160); b = Math.round(71); }
+    else { r = Math.round(80 + (1 - intensity) * 10); g = Math.round(100 + intensity * 40); b = Math.round(80 + (1 - intensity) * 10); }
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  } else {
+    var intensity = -ratio;
+    if (intensity > 0.6) return 'rgb(' + Math.round(183) + ',' + Math.round(28) + ',' + Math.round(28) + ')';
+    if (intensity > 0.3) return 'rgb(' + Math.round(211) + ',' + Math.round(47) + ',' + Math.round(47) + ')';
+    return 'rgb(' + Math.round(140 + intensity * 40) + ',' + Math.round(80 - intensity * 30) + ',' + Math.round(80 - intensity * 30) + ')';
+  }
+}
+
+function drawHeatmap() {
+  var metric = document.getElementById('hm-metric').value;
+  var groupBy = document.getElementById('hm-group').value;
+  var canvas = document.getElementById('hm-canvas');
+  
+  // Get data with the chosen metric
+  var data = allDataWithSPY.map(function(d) {
+    var etfData = allData.find(function(e) { return e.ticker === d.ticker; });
+    var val = 0;
+    if (metric === 'roc1m') val = d.roc1m;
+    else if (metric === 'roc3m') val = d.roc3m;
+    else if (metric === 'roc6m') val = d.roc6m;
+    else if (metric === 'roc12m') val = d.roc12m;
+    else if (etfData) {
+      if (metric === 'rsScore') val = etfData.rsScore;
+      else if (metric === 'rs1m') val = etfData.rs1m;
+      else if (metric === 'rs3m') val = etfData.rs3m;
+      else if (metric === 'rs6m') val = etfData.rs6m;
+      else if (metric === 'rs12m') val = etfData.rs12m;
+      else if (metric === 'pctlScore') val = etfData.pctlScore;
+    }
+    return {
+      ticker: d.ticker,
+      cat: d.cat,
+      subcat: d.subcat || d.cat,
+      val: val,
+      absVal: Math.abs(val)
+    };
+  }).filter(function(d) { return d.ticker && d.ticker !== 'SPY'; });
+  
+  // Sort by absolute value descending (biggest blocks first)
+  data.sort(function(a, b) { return b.absVal - a.absVal; });
+  
+  // Max for color scaling
+  var maxAbs = Math.max.apply(null, data.map(function(d) { return d.absVal; }));
+  if (maxAbs === 0) maxAbs = 1;
+  
+  // Sizing: proportional to absolute value, with min/max
+  var minSize = 70;
+  var maxSize = 150;
+  
+  // Group data
+  var groups = {};
+  if (groupBy === 'none') {
+    groups['Todos los ETFs'] = data;
+  } else {
+    data.forEach(function(d) {
+      var key = groupBy === 'cat' ? d.cat : d.subcat;
+      if (!key) key = 'Otro';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(d);
+    });
+  }
+  
+  // Sort groups by average value
+  var groupKeys = Object.keys(groups).sort(function(a, b) {
+    var avgA = groups[a].reduce(function(s, d) { return s + d.val; }, 0) / groups[a].length;
+    var avgB = groups[b].reduce(function(s, d) { return s + d.val; }, 0) / groups[b].length;
+    return avgB - avgA;
+  });
+  
+  var html = '';
+  groupKeys.forEach(function(group) {
+    var items = groups[group];
+    html += '<div class="hm-group-section">';
+    if (groupBy !== 'none') {
+      var avgVal = items.reduce(function(s, d) { return s + d.val; }, 0) / items.length;
+      var avgColor = avgVal >= 0 ? 'var(--green-strong)' : 'var(--red)';
+      html += '<div class="hm-group-label">' + group + ' <span style="font-family:JetBrains Mono;font-size:0.75rem;color:' + avgColor + '">' + (avgVal >= 0 ? '+' : '') + avgVal.toFixed(2) + '</span></div>';
+    }
+    html += '<div class="hm-grid">';
+    
+    items.forEach(function(d) {
+      var size = minSize + ((d.absVal / maxAbs) * (maxSize - minSize));
+      var bgColor = hmColor(d.val, maxAbs);
+      var prefix = d.val > 0 ? '+' : '';
+      var displayVal = metric === 'pctlScore' ? d.val.toFixed(1) + '%' : prefix + d.val.toFixed(2);
+      
+      html += '<div class="hm-cell" style="width:' + size + 'px;height:' + size + 'px;background:' + bgColor + '" onclick="openDetail(\'' + d.ticker + '\')" title="' + d.ticker + ': ' + displayVal + '">';
+      html += '<div class="hm-cell-ticker">' + d.ticker + '</div>';
+      html += '<div class="hm-cell-val">' + displayVal + '</div>';
+      html += '</div>';
+    });
+    
+    html += '</div></div>';
+  });
+  
+  canvas.innerHTML = html;
+}
+
+document.getElementById('hm-metric').addEventListener('change', function() { drawHeatmap(); });
+document.getElementById('hm-group').addEventListener('change', function() { drawHeatmap(); });
+
 // ===== THEME TOGGLE =====
 const toggleBtn = document.getElementById('theme-toggle');
 const toggleKnob = document.getElementById('toggle-knob');
@@ -805,6 +1000,7 @@ function setTheme(theme) {
   if (allData.length) {
     if (document.getElementById('tab-rrg').classList.contains('active')) drawRRG();
     if (document.getElementById('tab-corr').classList.contains('active')) drawCorrelation();
+    if (document.getElementById('tab-heatmap').classList.contains('active')) drawHeatmap();
   }
 }
 toggleBtn.addEventListener('click', () => {
