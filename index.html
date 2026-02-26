@@ -453,10 +453,20 @@
 
 <script>
 const CSV_URL_RAW = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQ5uGhOzwIrat1XzG3IW0f_KOHywLJVWLQr6vSkAg2e2cKjX8lXB8iupdXf4zTlSA/pub?gid=1683781233&single=true&output=csv';
-const CSV_URL = 'https://corsproxy.io/?' + encodeURIComponent(CSV_URL_RAW);
+
+// Multiple CORS proxies for fallback
+const CORS_PROXIES = [
+  (url) => 'https://corsproxy.io/?' + encodeURIComponent(url),
+  (url) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  (url) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
+];
 
 let allData = [], allDataWithSPY = [];
 let activeFilter = 'Todos', currentSort = 'rank', corrFilter = 'Sector GICS';
+let lastGoodData = null; // Cache of last valid data
+let lastGoodDataSPY = null;
+let consecutiveFailures = 0;
+const MAX_RETRIES = 2; // retries per proxy
 
 // ===== TABS =====
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -507,15 +517,74 @@ function getSignalClass(p) { return p>=75?'fuerte':p>=50?'positivo':p>=25?'neutr
 function getSignalText(p) { return p>=75?'FUERTE':p>=50?'POSITIVO':p>=25?'NEUTRAL':'DÉBIL'; }
 function getBarColor(p) { return p>=75?'var(--green-strong)':p>=50?'var(--blue)':p>=25?'var(--yellow)':'var(--red)'; }
 
+// ===== FETCH WITH PROXY FALLBACK =====
+async function fetchWithFallback(url, timeoutMs = 12000) {
+  for (let pi = 0; pi < CORS_PROXIES.length; pi++) {
+    const proxyUrl = CORS_PROXIES[pi](url);
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const resp = await fetch(proxyUrl, { signal: controller.signal });
+        clearTimeout(timer);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const text = await resp.text();
+        // Validate it's actual CSV, not an error page or HTML
+        if (!text || text.length < 100) throw new Error('Respuesta vacía o muy corta');
+        if (text.trim().startsWith('<!') || text.trim().startsWith('<html')) throw new Error('Respuesta HTML en vez de CSV');
+        return text;
+      } catch (err) {
+        console.warn(`Proxy ${pi+1} intento ${attempt+1} falló:`, err.message);
+        if (attempt < MAX_RETRIES) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+      }
+    }
+  }
+  throw new Error('Todos los proxies fallaron. Comprueba tu conexión.');
+}
+
+// ===== DATA VALIDATION =====
+function validateData(rawETFs) {
+  // Must have reasonable number of ETFs
+  if (rawETFs.length < 5) return { valid: false, reason: 'Muy pocos ETFs encontrados (' + rawETFs.length + ')' };
+  // Must have SPY
+  const spy = rawETFs.find(e => e.ticker === 'SPY');
+  if (!spy) return { valid: false, reason: 'SPY no encontrado en los datos' };
+  // Check if ALL ROC values are zero (sign of corrupted/stale data)
+  const nonSpy = rawETFs.filter(e => e.ticker !== 'SPY');
+  const allRocZero = nonSpy.every(e => e.roc1m === 0 && e.roc3m === 0 && e.roc6m === 0 && e.roc12m === 0);
+  if (allRocZero) return { valid: false, reason: 'Todos los ROC son 0.00 — datos probablemente corruptos' };
+  // Check if SPY price is zero (another sign of bad data)
+  if (spy.precio === 0) return { valid: false, reason: 'Precio de SPY es 0 — datos incompletos' };
+  return { valid: true };
+}
+
+// ===== STALE DATA BANNER =====
+function showDataWarning(msg) {
+  let banner = document.getElementById('data-warning-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'data-warning-banner';
+    banner.style.cssText = 'background:rgba(255,215,64,0.12);border:1px solid rgba(255,215,64,0.3);color:var(--yellow);padding:10px 20px;border-radius:12px;margin-bottom:16px;font-size:0.82rem;display:flex;align-items:center;gap:10px;font-family:Outfit,sans-serif;';
+    const container = document.querySelector('.container');
+    const tabBar = document.querySelector('.tab-bar');
+    container.insertBefore(banner, tabBar);
+  }
+  banner.innerHTML = '⚠️ <span>' + msg + '</span><button onclick="this.parentElement.remove();fetchData();" style="margin-left:auto;background:rgba(255,215,64,0.2);border:1px solid rgba(255,215,64,0.3);color:var(--yellow);padding:4px 14px;border-radius:8px;cursor:pointer;font-family:Outfit,sans-serif;font-size:0.78rem;white-space:nowrap;">🔄 Reintentar</button>';
+  banner.style.display = 'flex';
+}
+function hideDataWarning() {
+  const banner = document.getElementById('data-warning-banner');
+  if (banner) banner.style.display = 'none';
+}
+
 // ===== FETCH CURRENT DATA =====
 async function fetchData() {
   try {
-    const resp = await fetch(CSV_URL);
-    if (!resp.ok) throw new Error('Network error: ' + resp.status);
-    const rows = parseCSV(await resp.text());
+    const csvText = await fetchWithFallback(CSV_URL_RAW);
+    const rows = parseCSV(csvText);
     let hIdx = -1;
     for (let i = 0; i < Math.min(rows.length, 10); i++) if (rows[i].some(c => c.trim() === 'Ticker')) { hIdx = i; break; }
-    if (hIdx === -1) throw new Error('Header no encontrado');
+    if (hIdx === -1) throw new Error('Header no encontrado en el CSV');
     const hd = rows[hIdx].map(h => h.trim().toLowerCase());
     const col = {
       ticker: hd.indexOf('ticker'),
@@ -539,9 +608,28 @@ async function fetchData() {
         volRel: col.volRel >= 0 ? parseNum(r[col.volRel]) : null,
         rsVol: col.rsVol >= 0 ? parseNum(r[col.rsVol]) : null });
     }
+
+    // ===== VALIDATE DATA BEFORE RENDERING =====
+    const validation = validateData(rawETFs);
+    if (!validation.valid) {
+      console.warn('Datos inválidos:', validation.reason);
+      consecutiveFailures++;
+      // If we have cached good data, keep showing it with a warning
+      if (lastGoodData && lastGoodData.length > 0) {
+        showDataWarning(validation.reason + ' — Mostrando últimos datos válidos. Reintentando automáticamente...');
+        // Schedule a quick retry
+        setTimeout(fetchData, 30000);
+        return;
+      }
+      throw new Error(validation.reason);
+    }
+
+    // Data is valid — proceed
+    consecutiveFailures = 0;
+    hideDataWarning();
+
     allDataWithSPY = rawETFs;
     const spy = rawETFs.find(e => e.ticker === 'SPY');
-    if (!spy) throw new Error('SPY no encontrado');
     const etfs = rawETFs.filter(e => e.ticker !== 'SPY').map(e => ({
       ...e, rs1m:e.roc1m-spy.roc1m, rs3m:e.roc3m-spy.roc3m, rs6m:e.roc6m-spy.roc6m, rs12m:e.roc12m-spy.roc12m, volRel: e.volRel, rsVol: e.rsVol,
     }));
@@ -551,12 +639,34 @@ async function fetchData() {
     etfs.sort((a,b) => b.rsScore - a.rsScore);
     etfs.forEach((e,i) => { e.rank = i+1; });
     allData = etfs;
+
+    // Cache good data
+    lastGoodData = [...etfs];
+    lastGoodDataSPY = [...rawETFs];
+
     renderAll();
     document.getElementById('benchmark-text').textContent = `BENCHMARK: SPY ($${spy.precio.toFixed(2)}) | ${etfs.length} ETFs | LIVE`;
     document.getElementById('last-update').textContent = `Última actualización: ${new Date().toLocaleString('es-ES')} — Auto-refresh cada 20 min`;
   } catch(err) {
-    console.error(err);
-    document.getElementById('table-body').innerHTML = `<tr><td colspan="13" class="error-msg"><p>⚠️ ${err.message}</p></td></tr>`;
+    console.error('fetchData error:', err);
+    consecutiveFailures++;
+
+    // If we have cached data, show it with warning
+    if (lastGoodData && lastGoodData.length > 0) {
+      allData = lastGoodData;
+      allDataWithSPY = lastGoodDataSPY;
+      renderAll();
+      showDataWarning('Error al actualizar: ' + err.message + ' — Mostrando últimos datos válidos.');
+      // Retry sooner on failure
+      if (consecutiveFailures < 5) setTimeout(fetchData, 30000);
+    } else {
+      document.getElementById('table-body').innerHTML = `<tr><td colspan="13" class="error-msg">
+        <p>⚠️ ${err.message}</p>
+        <p style="margin-top:12px;font-size:0.8rem;color:var(--text-muted)">Reintentando en 30s... o <button onclick="fetchData()" style="color:var(--accent);background:none;border:1px solid var(--accent);border-radius:8px;padding:4px 12px;cursor:pointer;font-family:Outfit,sans-serif;">reintentar ahora</button></p>
+      </td></tr>`;
+      // Auto-retry
+      if (consecutiveFailures < 10) setTimeout(fetchData, 30000);
+    }
   }
 }
 
