@@ -453,20 +453,16 @@
 
 <script>
 const CSV_URL_RAW = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQ5uGhOzwIrat1XzG3IW0f_KOHywLJVWLQr6vSkAg2e2cKjX8lXB8iupdXf4zTlSA/pub?gid=1683781233&single=true&output=csv';
-
-// Multiple CORS proxies for fallback
 const CORS_PROXIES = [
-  (url) => 'https://corsproxy.io/?' + encodeURIComponent(url),
-  (url) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
-  (url) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
+  (u) => 'https://corsproxy.io/?' + encodeURIComponent(u),
+  (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+  (u) => u, // direct (works if CORS headers present)
 ];
 
 let allData = [], allDataWithSPY = [];
 let activeFilter = 'Todos', currentSort = 'rank', corrFilter = 'Sector GICS';
-let lastGoodData = null; // Cache of last valid data
-let lastGoodDataSPY = null;
-let consecutiveFailures = 0;
-const MAX_RETRIES = 2; // retries per proxy
+let fetchRetryCount = 0;
+const MAX_RETRIES = 5;
 
 // ===== TABS =====
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -498,12 +494,15 @@ function parseCSV(text) {
 }
 function parseNum(str) {
   if (!str) return 0;
-  let s = str.trim().replace(/["'$€\s]/g, '');
-  if (!s) return 0;
+  let s = str.trim().replace(/["'$€%\s]/g, '');
+  if (!s || s === '-' || s === '—' || s === 'N/A' || s === '#N/A' || s === '#REF!' || s === '#VALUE!') return 0;
+  // Handle Spanish locale: 1.234,56 → 1234.56
   if (s.includes('.') && s.includes(',') && s.lastIndexOf(',') > s.lastIndexOf('.'))
     s = s.replace(/\./g, '').replace(',', '.');
+  // Handle English locale: 1,234.56 → 1234.56
   else if (s.includes('.') && s.includes(',') && s.lastIndexOf('.') > s.lastIndexOf(','))
     s = s.replace(/,/g, '');
+  // Handle single comma as decimal separator: 5,23 → 5.23
   else if (s.includes(',')) s = s.replace(',', '.');
   const n = parseFloat(s); return isNaN(n) ? 0 : n;
 }
@@ -517,158 +516,237 @@ function getSignalClass(p) { return p>=75?'fuerte':p>=50?'positivo':p>=25?'neutr
 function getSignalText(p) { return p>=75?'FUERTE':p>=50?'POSITIVO':p>=25?'NEUTRAL':'DÉBIL'; }
 function getBarColor(p) { return p>=75?'var(--green-strong)':p>=50?'var(--blue)':p>=25?'var(--yellow)':'var(--red)'; }
 
-// ===== FETCH WITH PROXY FALLBACK =====
-async function fetchWithFallback(url, timeoutMs = 12000) {
-  for (let pi = 0; pi < CORS_PROXIES.length; pi++) {
-    const proxyUrl = CORS_PROXIES[pi](url);
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        const resp = await fetch(proxyUrl, { signal: controller.signal });
-        clearTimeout(timer);
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const text = await resp.text();
-        // Validate it's actual CSV, not an error page or HTML
-        if (!text || text.length < 100) throw new Error('Respuesta vacía o muy corta');
-        if (text.trim().startsWith('<!') || text.trim().startsWith('<html')) throw new Error('Respuesta HTML en vez de CSV');
-        return text;
-      } catch (err) {
-        console.warn(`Proxy ${pi+1} intento ${attempt+1} falló:`, err.message);
-        if (attempt < MAX_RETRIES) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-      }
-    }
-  }
-  throw new Error('Todos los proxies fallaron. Comprueba tu conexión.');
-}
-
-// ===== DATA VALIDATION =====
-function validateData(rawETFs) {
-  // Must have reasonable number of ETFs
-  if (rawETFs.length < 5) return { valid: false, reason: 'Muy pocos ETFs encontrados (' + rawETFs.length + ')' };
-  // Must have SPY
-  const spy = rawETFs.find(e => e.ticker === 'SPY');
-  if (!spy) return { valid: false, reason: 'SPY no encontrado en los datos' };
-  // Check if ALL ROC values are zero (sign of corrupted/stale data)
-  const nonSpy = rawETFs.filter(e => e.ticker !== 'SPY');
-  const allRocZero = nonSpy.every(e => e.roc1m === 0 && e.roc3m === 0 && e.roc6m === 0 && e.roc12m === 0);
-  if (allRocZero) return { valid: false, reason: 'Todos los ROC son 0.00 — datos probablemente corruptos' };
-  // Check if SPY price is zero (another sign of bad data)
-  if (spy.precio === 0) return { valid: false, reason: 'Precio de SPY es 0 — datos incompletos' };
-  return { valid: true };
-}
-
-// ===== STALE DATA BANNER =====
-function showDataWarning(msg) {
-  let banner = document.getElementById('data-warning-banner');
-  if (!banner) {
-    banner = document.createElement('div');
-    banner.id = 'data-warning-banner';
-    banner.style.cssText = 'background:rgba(255,215,64,0.12);border:1px solid rgba(255,215,64,0.3);color:var(--yellow);padding:10px 20px;border-radius:12px;margin-bottom:16px;font-size:0.82rem;display:flex;align-items:center;gap:10px;font-family:Outfit,sans-serif;';
-    const container = document.querySelector('.container');
-    const tabBar = document.querySelector('.tab-bar');
-    container.insertBefore(banner, tabBar);
-  }
-  banner.innerHTML = '⚠️ <span>' + msg + '</span><button onclick="this.parentElement.remove();fetchData();" style="margin-left:auto;background:rgba(255,215,64,0.2);border:1px solid rgba(255,215,64,0.3);color:var(--yellow);padding:4px 14px;border-radius:8px;cursor:pointer;font-family:Outfit,sans-serif;font-size:0.78rem;white-space:nowrap;">🔄 Reintentar</button>';
-  banner.style.display = 'flex';
-}
-function hideDataWarning() {
-  const banner = document.getElementById('data-warning-banner');
-  if (banner) banner.style.display = 'none';
-}
-
 // ===== FETCH CURRENT DATA =====
+async function fetchWithProxy(url, proxyIndex = 0) {
+  if (proxyIndex >= CORS_PROXIES.length) throw new Error('Todos los proxies CORS fallaron');
+  try {
+    // Add cache-busting parameter to avoid stale "Cargando..." responses
+    const bustUrl = url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
+    const proxyUrl = CORS_PROXIES[proxyIndex](bustUrl);
+    const resp = await fetch(proxyUrl, { 
+      signal: AbortSignal.timeout(15000),
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' }
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const text = await resp.text();
+    // Validate it looks like CSV (not an HTML error page)
+    if (text.trim().startsWith('<!') || text.trim().startsWith('<html')) {
+      throw new Error('Proxy devolvió HTML en vez de CSV');
+    }
+    return text;
+  } catch(e) {
+    console.warn(`Proxy ${proxyIndex} falló: ${e.message}, intentando siguiente...`);
+    return fetchWithProxy(url, proxyIndex + 1);
+  }
+}
+
+function findCol(headers, ...patterns) {
+  return headers.findIndex(h => patterns.some(p => {
+    if (p instanceof RegExp) return p.test(h);
+    return h.includes(p);
+  }));
+}
+
 async function fetchData() {
   try {
-    const csvText = await fetchWithFallback(CSV_URL_RAW);
+    const csvText = await fetchWithProxy(CSV_URL_RAW);
     const rows = parseCSV(csvText);
     let hIdx = -1;
-    for (let i = 0; i < Math.min(rows.length, 10); i++) if (rows[i].some(c => c.trim() === 'Ticker')) { hIdx = i; break; }
-    if (hIdx === -1) throw new Error('Header no encontrado en el CSV');
+    for (let i = 0; i < Math.min(rows.length, 10); i++) {
+      if (rows[i].some(c => c.trim().toLowerCase() === 'ticker')) { hIdx = i; break; }
+    }
+    if (hIdx === -1) throw new Error('Header "Ticker" no encontrado en el CSV');
     const hd = rows[hIdx].map(h => h.trim().toLowerCase());
+    
+    console.log('CSV headers encontrados:', hd);
+    
+    // Detect which sheet format we're reading
+    const hasRSCols = hd.some(h => /^rs\s+1m$/.test(h) || h === 'rs 1m');
+    const hasROCCols = hd.some(h => /roc.*1\s*m/.test(h));
+    const sheetMode = hasRSCols ? 'RS_vs_SPY' : (hasROCCols ? 'Datos_ETF' : 'unknown');
+    console.log('Sheet mode detectado:', sheetMode);
+
     const col = {
       ticker: hd.indexOf('ticker'),
-      cat: hd.findIndex(h => h==='categoría'||h==='categoria'),
-      subcat: hd.findIndex(h => h.includes('sub-categ')),
-      roc1m: hd.findIndex(h => h.includes('roc 1m')),
-      roc3m: hd.findIndex(h => h.includes('roc 3m')),
-      roc6m: hd.findIndex(h => h.includes('roc 6m')),
-      roc12m: hd.findIndex(h => h.includes('roc 12m')),
-      precio: hd.findIndex(h => h.includes('precio actual')),
-      volRel: hd.findIndex(h => h.includes('volumen relativo') || h.includes('vol relativo') || h.includes('vol. relativo')),
-      rsVol: hd.findIndex(h => h.includes('rs vol') || h.includes('rs volume')),
+      cat: findCol(hd, 'categoría', 'categoria', 'category', 'cat'),
+      subcat: findCol(hd, 'sub-categ', 'subcateg', 'sub categ'),
+      // RS columns (RS_vs_SPY sheet)
+      rs1m: findCol(hd, /^rs\s*1m$/, 'rs 1m'),
+      rs3m: findCol(hd, /^rs\s*3m$/, 'rs 3m'),
+      rs6m: findCol(hd, /^rs\s*6m$/, 'rs 6m'),
+      rs12m: findCol(hd, /^rs\s*12m$/, 'rs 12m'),
+      rsScore: findCol(hd, 'rs score'),
+      // ROC columns (Datos_ETF sheet)
+      roc1m: findCol(hd, /roc.*1\s*m/),
+      roc3m: findCol(hd, /roc.*3\s*m/),
+      roc6m: findCol(hd, /roc.*6\s*m/),
+      roc12m: findCol(hd, /roc.*12\s*m/),
+      // Prices
+      precio: findCol(hd, 'precio actual', /^precio$/),
+      precio1m: findCol(hd, 'precio 1m', /precio.*1\s*m/),
+      precio3m: findCol(hd, 'precio 3m', /precio.*3\s*m/),
+      precio6m: findCol(hd, 'precio 6m', /precio.*6\s*m/),
+      precio12m: findCol(hd, 'precio 12m', /precio.*12\s*m/),
+      // Other
+      momentum: findCol(hd, 'momentum score', 'momentum'),
+      volRel: findCol(hd, 'volumen relativo', 'vol relativo', 'vol. relativo'),
+      rsVol: findCol(hd, 'rs vol', 'rs volume', 'rsvol'),
     };
-    const rawETFs = [];
-    for (let i = hIdx+1; i < rows.length; i++) {
-      const r = rows[i]; if (!r || r.length < 5) continue;
-      const ticker = (r[col.ticker]||'').trim(); if (!ticker || ticker.length > 6) continue;
-      rawETFs.push({ ticker, cat:(r[col.cat]||'').trim(), subcat:(r[col.subcat]||'').trim(),
-        roc1m:parseNum(r[col.roc1m]), roc3m:parseNum(r[col.roc3m]),
-        roc6m:parseNum(r[col.roc6m]), roc12m:parseNum(r[col.roc12m]), precio:parseNum(r[col.precio]),
-        volRel: col.volRel >= 0 ? parseNum(r[col.volRel]) : null,
-        rsVol: col.rsVol >= 0 ? parseNum(r[col.rsVol]) : null });
+
+    function isLoading(val) {
+      if (!val) return false;
+      const v = val.trim().toLowerCase();
+      return v.includes('cargando') || v.includes('loading') || v === '...' || v === '#getting_data';
+    }
+    function isNA(val) {
+      if (!val) return false;
+      const v = val.trim();
+      return v === '#N/A' || v === '#REF!' || v === '#VALUE!' || v.toLowerCase() === 'error';
+    }
+    function safeNum(r, colIdx) {
+      if (colIdx < 0) return 0;
+      const raw = r[colIdx];
+      if (!raw || isLoading(raw) || isNA(raw)) return 0;
+      return parseNum(raw);
     }
 
-    // ===== VALIDATE DATA BEFORE RENDERING =====
-    const validation = validateData(rawETFs);
-    if (!validation.valid) {
-      console.warn('Datos inválidos:', validation.reason);
-      consecutiveFailures++;
-      // If we have cached good data, keep showing it with a warning
-      if (lastGoodData && lastGoodData.length > 0) {
-        showDataWarning(validation.reason + ' — Mostrando últimos datos válidos. Reintentando automáticamente...');
-        // Schedule a quick retry
-        setTimeout(fetchData, 30000);
+    const rawETFs = [];
+    
+    if (sheetMode === 'RS_vs_SPY') {
+      // RS_vs_SPY: columns are already RS (relative to SPY)
+      for (let i = hIdx+1; i < rows.length; i++) {
+        const r = rows[i]; if (!r || r.length < 5) continue;
+        const ticker = (r[col.ticker]||'').trim(); if (!ticker || ticker.length > 6) continue;
+        const rs1m = safeNum(r, col.rs1m);
+        const rs3m = safeNum(r, col.rs3m);
+        const rs6m = safeNum(r, col.rs6m);
+        const rs12m = safeNum(r, col.rs12m);
+        let rsScore = safeNum(r, col.rsScore);
+        if (rsScore === 0 && (rs1m !== 0 || rs3m !== 0 || rs6m !== 0 || rs12m !== 0)) {
+          rsScore = rs1m * 0.35 + rs3m * 0.30 + rs6m * 0.20 + rs12m * 0.15;
+        }
+        rawETFs.push({
+          ticker, cat: (r[col.cat]||'').trim(),
+          subcat: (col.subcat >= 0 ? (r[col.subcat]||'').trim() : ''),
+          rs1m, rs3m, rs6m, rs12m, rsScore,
+          roc1m: rs1m, roc3m: rs3m, roc6m: rs6m, roc12m: rs12m,
+          precio: safeNum(r, col.precio),
+          momentum: safeNum(r, col.momentum),
+          volRel: col.volRel >= 0 ? safeNum(r, col.volRel) : null,
+          rsVol: col.rsVol >= 0 ? safeNum(r, col.rsVol) : null,
+        });
+      }
+    } else {
+      // Datos_ETF: ROC columns, need SPY subtraction
+      for (let i = hIdx+1; i < rows.length; i++) {
+        const r = rows[i]; if (!r || r.length < 5) continue;
+        const ticker = (r[col.ticker]||'').trim(); if (!ticker || ticker.length > 6) continue;
+        let roc1m = safeNum(r, col.roc1m);
+        let roc3m = safeNum(r, col.roc3m);
+        let roc6m = safeNum(r, col.roc6m);
+        let roc12m = safeNum(r, col.roc12m);
+        const precioActual = safeNum(r, col.precio);
+        if (roc1m === 0 && roc3m === 0 && roc6m === 0 && roc12m === 0 && precioActual > 0) {
+          const p1m = safeNum(r, col.precio1m);
+          const p3m = safeNum(r, col.precio3m);
+          const p6m = safeNum(r, col.precio6m);
+          const p12m = safeNum(r, col.precio12m);
+          if (p1m > 0) roc1m = ((precioActual / p1m) - 1) * 100;
+          if (p3m > 0) roc3m = ((precioActual / p3m) - 1) * 100;
+          if (p6m > 0) roc6m = ((precioActual / p6m) - 1) * 100;
+          if (p12m > 0) roc12m = ((precioActual / p12m) - 1) * 100;
+        }
+        rawETFs.push({
+          ticker, cat: (r[col.cat]||'').trim(),
+          subcat: (col.subcat >= 0 ? (r[col.subcat]||'').trim() : ''),
+          roc1m, roc3m, roc6m, roc12m, precio: precioActual,
+          momentum: safeNum(r, col.momentum),
+          volRel: col.volRel >= 0 ? safeNum(r, col.volRel) : null,
+          rsVol: col.rsVol >= 0 ? safeNum(r, col.rsVol) : null,
+        });
+      }
+    }
+
+    // Detect Cargando or all-zero
+    const sampleRow = rows[hIdx+1] || [];
+    const dataCols = sheetMode === 'RS_vs_SPY'
+      ? [col.rs1m, col.rs3m, col.rs6m, col.rs12m]
+      : [col.roc1m, col.roc3m, col.roc6m, col.roc12m];
+    const validCols = dataCols.filter(c => c >= 0);
+    const hasCargando = rawETFs.length > 0 && validCols.some(c => isLoading(sampleRow[c]));
+    const keyField = sheetMode === 'RS_vs_SPY' ? 'rs1m' : 'roc1m';
+    const nonZero = rawETFs.filter(e => e[keyField] !== 0 || e[keyField.replace('1m','3m')] !== 0);
+    const allZero = rawETFs.length > 0 && nonZero.length === 0;
+
+    if (hasCargando || allZero) {
+      fetchRetryCount++;
+      const reason = hasCargando
+        ? 'Google Sheets aún está calculando las fórmulas (\"Cargando...\")'
+        : 'Todos los valores RS/ROC son 0';
+      if (fetchRetryCount <= MAX_RETRIES) {
+        const waitSec = hasCargando ? fetchRetryCount * 15 : fetchRetryCount * 10;
+        let countdownSec = waitSec;
+        document.getElementById('table-body').innerHTML = '<tr><td colspan="13" class="error-msg" style="color:var(--yellow)">' +
+          '<p style="font-size:1rem;">⚠️ ' + reason + '</p>' +
+          '<p style="margin-top:6px;">Reintentando en <span id="retry-countdown" style="font-family:JetBrains Mono,monospace;font-weight:700;">' + waitSec + '</span>s... (' + fetchRetryCount + '/' + MAX_RETRIES + ')</p>' +
+          (hasCargando ? '<p style="margin-top:8px;font-size:0.78rem;color:var(--text-muted);">Tip: Abre tu Google Sheet en el navegador para forzar el recálculo, luego haz clic en reintentar.</p>' : '') +
+          '<p style="margin-top:12px"><button onclick="fetchRetryCount=0;fetchData();" style="padding:10px 28px;border:1px solid var(--accent);border-radius:10px;background:transparent;color:var(--accent);cursor:pointer;font-family:Outfit,sans-serif;font-weight:600;font-size:0.9rem;">⟳ reintentar ahora</button></p>' +
+          '</td></tr>';
+        const cdInterval = setInterval(function() {
+          countdownSec--;
+          const el = document.getElementById('retry-countdown');
+          if (el) el.textContent = Math.max(0, countdownSec);
+          if (countdownSec <= 0) clearInterval(cdInterval);
+        }, 1000);
+        setTimeout(fetchData, waitSec * 1000);
         return;
       }
-      throw new Error(validation.reason);
     }
+    fetchRetryCount = 0;
 
-    // Data is valid — proceed
-    consecutiveFailures = 0;
-    hideDataWarning();
-
+    // Build final ETF array
     allDataWithSPY = rawETFs;
-    const spy = rawETFs.find(e => e.ticker === 'SPY');
-    const etfs = rawETFs.filter(e => e.ticker !== 'SPY').map(e => ({
-      ...e, rs1m:e.roc1m-spy.roc1m, rs3m:e.roc3m-spy.roc3m, rs6m:e.roc6m-spy.roc6m, rs12m:e.roc12m-spy.roc12m, volRel: e.volRel, rsVol: e.rsVol,
-    }));
-    etfs.forEach(e => { e.rsScore = e.rs1m*0.35 + e.rs3m*0.30 + e.rs6m*0.20 + e.rs12m*0.15; });
-    const allScores = etfs.map(e => e.rsScore);
-    etfs.forEach(e => { e.pctlScore = percentRank(allScores, e.rsScore); });
-    etfs.sort((a,b) => b.rsScore - a.rsScore);
-    etfs.forEach((e,i) => { e.rank = i+1; });
-    allData = etfs;
+    let etfs;
 
-    // Cache good data
-    lastGoodData = [...etfs];
-    lastGoodDataSPY = [...rawETFs];
-
-    renderAll();
-    document.getElementById('benchmark-text').textContent = `BENCHMARK: SPY ($${spy.precio.toFixed(2)}) | ${etfs.length} ETFs | LIVE`;
-    document.getElementById('last-update').textContent = `Última actualización: ${new Date().toLocaleString('es-ES')} — Auto-refresh cada 20 min`;
-  } catch(err) {
-    console.error('fetchData error:', err);
-    consecutiveFailures++;
-
-    // If we have cached data, show it with warning
-    if (lastGoodData && lastGoodData.length > 0) {
-      allData = lastGoodData;
-      allDataWithSPY = lastGoodDataSPY;
-      renderAll();
-      showDataWarning('Error al actualizar: ' + err.message + ' — Mostrando últimos datos válidos.');
-      // Retry sooner on failure
-      if (consecutiveFailures < 5) setTimeout(fetchData, 30000);
+    if (sheetMode === 'RS_vs_SPY') {
+      etfs = rawETFs.map(function(e) { return Object.assign({}, e); });
+      etfs.forEach(function(e) {
+        if (!e.rsScore && (e.rs1m !== 0 || e.rs3m !== 0)) {
+          e.rsScore = e.rs1m * 0.35 + e.rs3m * 0.30 + e.rs6m * 0.20 + e.rs12m * 0.15;
+        }
+      });
     } else {
-      document.getElementById('table-body').innerHTML = `<tr><td colspan="13" class="error-msg">
-        <p>⚠️ ${err.message}</p>
-        <p style="margin-top:12px;font-size:0.8rem;color:var(--text-muted)">Reintentando en 30s... o <button onclick="fetchData()" style="color:var(--accent);background:none;border:1px solid var(--accent);border-radius:8px;padding:4px 12px;cursor:pointer;font-family:Outfit,sans-serif;">reintentar ahora</button></p>
-      </td></tr>`;
-      // Auto-retry
-      if (consecutiveFailures < 10) setTimeout(fetchData, 30000);
+      const spy = rawETFs.find(function(e) { return e.ticker === 'SPY'; });
+      if (!spy) throw new Error('SPY no encontrado en los datos');
+      etfs = rawETFs.filter(function(e) { return e.ticker !== 'SPY'; }).map(function(e) {
+        return Object.assign({}, e, {
+          rs1m: e.roc1m - spy.roc1m, rs3m: e.roc3m - spy.roc3m,
+          rs6m: e.roc6m - spy.roc6m, rs12m: e.roc12m - spy.roc12m,
+        });
+      });
+      etfs.forEach(function(e) {
+        e.rsScore = e.rs1m * 0.35 + e.rs3m * 0.30 + e.rs6m * 0.20 + e.rs12m * 0.15;
+      });
     }
+
+    const allScores = etfs.map(function(e) { return e.rsScore; });
+    etfs.forEach(function(e) { e.pctlScore = percentRank(allScores, e.rsScore); });
+    etfs.sort(function(a, b) { return b.rsScore - a.rsScore; });
+    etfs.forEach(function(e, i) { e.rank = i + 1; });
+    allData = etfs;
+    renderAll();
+
+    const spyRow = rawETFs.find(function(e) { return e.ticker === 'SPY'; });
+    const precioText = spyRow && spyRow.precio > 0 ? ' ($' + spyRow.precio.toFixed(2) + ')' : '';
+    document.getElementById('benchmark-text').textContent = 'BENCHMARK: SPY' + precioText + ' | ' + etfs.length + ' ETFs | LIVE';
+    document.getElementById('last-update').textContent = 'Última actualización: ' + new Date().toLocaleString('es-ES') + ' — Auto-refresh cada 20 min';
+  } catch(err) {
+    console.error(err);
+    document.getElementById('table-body').innerHTML = '<tr><td colspan="13" class="error-msg"><p>⚠️ ' + err.message + '</p><p style="margin-top:8px"><button onclick="fetchRetryCount=0;fetchData();" style="padding:10px 28px;border:1px solid var(--accent);border-radius:10px;background:transparent;color:var(--accent);cursor:pointer;font-family:Outfit,sans-serif;font-weight:600;">⟳ Reintentar</button></p></td></tr>';
   }
 }
+
 
 // ===== TABLE =====
 function renderAll() { renderStats(); renderFilters(); renderTable(); renderCorrFilters(); }
